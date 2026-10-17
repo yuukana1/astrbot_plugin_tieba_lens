@@ -7,12 +7,15 @@ import importlib
 import io
 import sys
 import tempfile
+import threading
+import time
 import types
 import unittest
 from pathlib import Path
 from unittest.mock import AsyncMock, Mock, patch
 
 from jinja2 import Environment
+from fontTools.ttLib import TTFont
 from PIL import Image
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -22,6 +25,11 @@ if PACKAGE not in sys.modules:
     package.__path__ = [str(ROOT)]
     sys.modules[PACKAGE] = package
 renderer = importlib.import_module(f"{PACKAGE}.renderer")
+
+
+def font_characters(source):
+    with TTFont(io.BytesIO(base64.b64decode(source.split(",", 1)[1]))) as font:
+        return set(font.getBestCmap())
 
 
 def document(text="正文", segments=None):
@@ -51,12 +59,18 @@ class SafeAssets(unittest.TestCase):
         self.assertEqual({theme["font"] for theme in renderer._THEMES.values()}, {"lxgw"})
         self.assertEqual(set(renderer._FONT_FILES), {"lxgw"})
         self.assertEqual(set(renderer._FONT_FAMILIES), {"lxgw", "custom"})
-        assets = renderer.CardRenderer._load_font_assets()
-        self.assertEqual(set(assets), {"lxgw"})
-        self.assertEqual(base64.b64decode(assets["lxgw"].split(",", 1)[1]),
-                         (ROOT / "templates/fonts/LXGWWenKaiScreen-Subset.woff2").read_bytes())
-        for name in ("HYRunYuan-55S.ttf", "HYRunYuan-Subset.woff2", "HYTangMeiRen-55W.ttf", "HYTangMeiRen-Subset.woff2"):
+        self.assertEqual(renderer._FONT_FILES["lxgw"], "LXGWWenKaiScreen.woff2")
+        self.assertTrue((ROOT / "templates/fonts/LXGWWenKaiScreen.woff2").is_file())
+        for name in ("LXGWWenKaiScreen.ttf", "LXGWWenKaiScreen-Subset.woff2",
+                     "HYRunYuan-55S.ttf", "HYRunYuan-Subset.woff2", "HYTangMeiRen-55W.ttf", "HYTangMeiRen-Subset.woff2"):
             self.assertFalse((ROOT / "templates/fonts" / name).exists(), name)
+
+    def test_default_footer_font_reads_the_verified_cache_path(self):
+        path = Path("plugin_data/fonts/bundled/verified.sfnt")
+        expected = renderer.ImageFont.load_default()
+        with patch.object(renderer.ImageFont, "truetype", return_value=expected) as load:
+            self.assertIs(renderer.CardRenderer._font(17, font_path=path), expected)
+        load.assert_called_once_with(str(path), 17)
 
     def test_custom_footer_font_reads_the_same_immutable_font_bytes(self):
         raw = b"font-snapshot-for-footer"
@@ -334,7 +348,10 @@ class RenderFlow(unittest.IsolatedAsyncioTestCase):
                     await cards.render(document(), option, f"font_{index}")
                     self.assertEqual(contexts[-1]["font_key"], "lxgw")
                     self.assertEqual(contexts[-1]["font_family"], "LXGW WenKai Screen")
-                    self.assertEqual(contexts[-1]["font_face_src"], cards._font_assets["lxgw"])
+                    source = contexts[-1]["font_face_src"]
+                    self.assertTrue(source.startswith("data:font/woff2;base64,"))
+                    self.assertLess(len(source), 2 * 1024 * 1024)
+                    self.assertTrue(set(map(ord, "正文真实标题测试吧楼主")) <= font_characters(source))
                     self.assertEqual(contexts[-1]["fallback_font_face_src"], "")
 
     async def test_missing_custom_font_falls_back_with_persisted_diagnostic(self):
@@ -355,7 +372,10 @@ class RenderFlow(unittest.IsolatedAsyncioTestCase):
                     with self.subTest(show_source=visible), patch.object(cards, "_footer", wraps=cards._footer) as footer:
                         await cards.render(doc, {"font_override": "custom", "show_source": visible}, f"missing_{visible}")
                         self.assertEqual(contexts[-1]["font_key"], "lxgw")
-                        self.assertEqual(contexts[-1]["font_face_src"], cards._font_assets["lxgw"])
+                        source = contexts[-1]["font_face_src"]
+                        self.assertTrue(source.startswith("data:font/woff2;base64,"))
+                        self.assertLess(len(source), 2 * 1024 * 1024)
+                        self.assertTrue(set(map(ord, "自定义字体霞鹜文楷")) <= font_characters(source))
                         self.assertEqual(footer.call_args.kwargs["font_key"], "lxgw")
                         self.assertIsNone(footer.call_args.kwargs["font_data"])
                         self.assertTrue(any("自定义字体" in warning and "霞鹜文楷" in warning for warning in doc["warnings"]))
@@ -386,7 +406,10 @@ class RenderFlow(unittest.IsolatedAsyncioTestCase):
                     self.assertEqual(context["font_family"], "Tieba Custom Font")
                     self.assertEqual(context["font_format"], font_format)
                     self.assertEqual(base64.b64decode(context["font_face_src"].split(",", 1)[1]), raw)
-                    self.assertEqual(context["fallback_font_face_src"], cards._font_assets["lxgw"])
+                    fallback = context["fallback_font_face_src"]
+                    self.assertTrue(fallback.startswith("data:font/woff2;base64,"))
+                    self.assertLess(len(fallback), 2 * 1024 * 1024)
+                    self.assertTrue(set(map(ord, "正文真实标题测试吧楼主")) <= font_characters(fallback))
                     html = Environment(autoescape=True).from_string(cards.template).render(**context)
                     self.assertIn(f'format("{font_format}")', html)
                     self.assertIn('font-family:"Tieba Custom Font"', html)
@@ -394,6 +417,41 @@ class RenderFlow(unittest.IsolatedAsyncioTestCase):
                     self.assertEqual(footer.call_args.kwargs["font_key"], "custom")
                     self.assertIs(footer.call_args.kwargs["font_data"], raw)
                     load.assert_called_once_with()
+
+    async def test_one_worker_subset_covers_all_pages_placeholders_names_and_warnings(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            contexts, workers = [], []
+            async def capture(template, context, options):
+                contexts.append(context)
+                path = root / "capture.png"
+                with Image.new("RGB", (960, 100), "white") as image:
+                    image.save(path)
+                return str(path)
+            cards = renderer.CardRenderer(capture, root)
+            cards._load_assets = AsyncMock(return_value=({}, ["抓取警告：图像暂不可用"]))
+            doc = document(segments=[{"type": "text", "text": "首楼正文龘"},
+                                     {"type": "image", "alt": "罕字图解", "url": "https://tiebapic.baidu.com/missing.png"}])
+            doc["title"] = "繁體標題"
+            doc["posts"][0]["author"]["name"] = "用户鬱"
+            doc["warnings"] = ["原帖说明：末尾字符麤"]
+            doc["posts"].append({**doc["posts"][0], "id": "p2", "floor": 2,
+                                 "segments": [{"type": "text", "text": "最后一页齉"}]})
+            options = {"single_image": False, "show_source": True}
+            blocks = cards._build_blocks(doc, options, 960, {})
+            make_subset = cards._bundled_font.subset_for_context
+            def tracked(*args):
+                workers.append(threading.get_ident())
+                return make_subset(*args)
+            with patch.object(cards, "_paginate", return_value=[blocks[:1], blocks[1:]]), \
+                 patch.object(cards._bundled_font, "subset_for_context", side_effect=tracked) as subset:
+                await cards.render(doc, options, "font_all_pages")
+            self.assertEqual(subset.call_count, 1)
+            self.assertNotEqual(workers[0], threading.get_ident())
+            self.assertEqual(len(contexts), 2)
+            self.assertEqual(contexts[0]["font_face_src"], contexts[1]["font_face_src"])
+            expected = set(map(ord, "繁體標題用户鬱首楼正文龘罕字图解图片暂不可用原帖说明末尾字符麤最后一页齉抓取警告回复楼主"))
+            self.assertTrue(expected <= font_characters(contexts[0]["font_face_src"]))
 
     @staticmethod
     def numbered_blocks(count):
@@ -440,6 +498,52 @@ class RenderFlow(unittest.IsolatedAsyncioTestCase):
              patch.object(renderer.socket, "getaddrinfo", return_value=public_dns):
             assets, warnings = await cards._load_assets(doc, options or {}, 960)
         return assets, warnings, requests
+
+    async def test_asset_downloads_remain_parallel_while_pillow_normalization_is_serial(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            cards = renderer.CardRenderer(AsyncMock(), Path(temporary))
+            doc = document(segments=[{"type": "image", "url": f"https://tiebapic.baidu.com/{index}.png"}
+                                     for index in range(8)])
+            network_active = network_peak = normalize_active = normalize_peak = 0
+            normalize_calls = 0
+            counters = threading.Lock()
+
+            async def respond(request):
+                nonlocal network_active, network_peak
+                network_active += 1
+                network_peak = max(network_peak, network_active)
+                try:
+                    await asyncio.sleep(0.02)
+                    return renderer.httpx.Response(200, content=b"encoded image", headers={"content-type": "image/png"})
+                finally:
+                    network_active -= 1
+
+            def normalize(body, kind, width):
+                nonlocal normalize_active, normalize_peak, normalize_calls
+                with counters:
+                    normalize_active += 1
+                    normalize_peak = max(normalize_peak, normalize_active)
+                    normalize_calls += 1
+                try:
+                    time.sleep(0.025)
+                    return {"src": "data:image/png;base64,AA==", "width": 8, "height": 8}
+                finally:
+                    with counters:
+                        normalize_active -= 1
+
+            client_type = renderer.httpx.AsyncClient
+            transport = renderer.httpx.MockTransport(respond)
+            public_dns = [(renderer.socket.AF_INET, renderer.socket.SOCK_STREAM, 6, "", ("8.8.8.8", 443))]
+            with patch.object(renderer.httpx, "AsyncClient", side_effect=lambda **kwargs: client_type(transport=transport, **kwargs)), \
+                 patch.object(renderer.socket, "getaddrinfo", return_value=public_dns), \
+                 patch.object(cards, "_normalize_asset", side_effect=normalize):
+                assets, warnings = await cards._load_assets(doc, {}, 960)
+            self.assertEqual(len(assets), 8)
+            self.assertEqual(warnings, [])
+            self.assertEqual(normalize_calls, 8)
+            self.assertEqual(normalize_peak, 1)
+            self.assertGreaterEqual(network_peak, 2)
+            self.assertLessEqual(network_peak, 4)
 
     async def test_twelve_floors_with_six_replies_load_all_avatars_after_body_resources(self):
         with tempfile.TemporaryDirectory() as temporary:

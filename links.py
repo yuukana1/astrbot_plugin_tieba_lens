@@ -25,7 +25,7 @@ _USER = re.compile(r"[A-Za-z0-9_.-]{1,192}\Z", re.ASCII)
 _URL_TEXT = re.compile(
     r"(?<![\w.@/:-])(?:https?://|//)?"
     r"(?:(?:m|wapp)\.tieba\.baidu\.com|tieba\.baidu\.com|tb\.baidu\.com)"
-    r"[^\s<>\"'\[\]{}\x00-\x1f\x7f]*", re.I,
+    r"[^\s<>\"'\[\]{}\x00-\x1f\x7f]*", re.IGNORECASE,
 )
 _TRAILING = ".,!;:，。！？；：)]}＞>\"'"
 _SKIP_KEYS = {
@@ -41,16 +41,17 @@ _MESSAGE_KEYS = {
 }
 _URL_KEYS = {
     "url", "link", "href", "jumpurl", "jump_url", "qqdocurl", "shareurl", "share_url",
-    "targeturl", "target_url", "weburl", "web_url", "linkurl", "contentjumpurl",
+    "targeturl", "target_url", "weburl", "web_url", "linkurl", "contentjumpurl", "pcjumpurl",
 }
 _PAGE_KEYS = {"pagepath", "page_path", "path"}
-_APP_KEYS = {"appname", "app_name", "applicationname", "sourcename", "sourcedisplayname"}
-_APP_IDS = {"com.baidu.tieba", "com.baidu.tieba.miniapp", "百度贴吧"}
-_APP_ID_KEYS = {"appid", "app_id", "app", "package", "username"}
-_MINI_TYPES = {"miniapp", "mini_app", "miniprogram", "mini_program", "weapp"}
+_APP_KEYS = {"appname", "app_name", "applicationname", "sourcename", "sourcedisplayname", "source"}
+_APP_IDS = {"com.baidu.tieba", "com.baidu.tieba.miniapp", "百度贴吧", "贴吧", "wx7a2de562948f667b"}
+_APP_ID_KEYS = {"appid", "app_id", "app", "package", "username", "mini_app_id"}
+_MINI_TYPES = {"miniapp", "mini_app", "miniprogram", "mini_program", "weapp", "lightapp"}
 _POST_PATHS = {
     "pages/pb/pb", "pages/pb/index", "pages/thread/index", "pages/thread/thread",
     "pages/post/index", "pages/post/post",
+    "pages/uni-pb/uni-pb.html",
 }
 _FORUM_PATHS = {"pages/frs/frs", "pages/frs/index", "pages/forum/index", "pages/forum/forum"}
 
@@ -110,7 +111,7 @@ def parse_url(value: str) -> dict | None:
     value = html.unescape(value.strip())
     # A card may percent-encode its entire URL. Ordinary query values are left
     # encoded until parse_qs, so a forum name containing '&' stays one value.
-    if re.match(r"https?%3a", value, re.I):
+    if re.match(r"https?%3a", value, re.IGNORECASE):
         value = _decode(value)
     if any(ord(c) < 33 for c in value) or "\\" in value or len(value) > MAX_URL:
         return None
@@ -171,7 +172,7 @@ def _mini_target(value: str) -> dict | None:
     if len(value) > MAX_URL:
         return None
     value = html.unescape(value).lstrip("/")
-    if re.match(r"(?:%2f)?pages%2f", value, re.I):
+    if re.match(r"(?:%2f)?pages%2f", value, re.IGNORECASE):
         value = unquote(value).lstrip("/")
     if "://" in value or "\\" in value or any(ord(c) < 33 for c in value):
         return None
@@ -188,6 +189,43 @@ def _mini_target(value: str) -> dict | None:
         name = _one(params, ("kw", "word", "forum_name"))
         return _forum(name) if name else None
     return None
+
+
+def parse_miniapp_path(value: str) -> dict | None:
+    """A Tieba page path from a separately verified mini-program identity."""
+    return _mini_target(value) if isinstance(value, str) else None
+
+
+def parse_miniapp_share_url(value: str) -> dict | None:
+    """Validate an opaque QQ share address; its app identity is checked separately.
+
+    This is deliberately absent from plain-text URL matching. Only an explicit
+    Tieba card may request QQ's read-only mini-program link metadata.
+    """
+    if (not isinstance(value, str) or not value or len(value) > MAX_URL
+            or any(ord(c) < 32 or ord(c) == 127 for c in value)):
+        return None
+    value = html.unescape(value.strip())
+    if any(ord(c) < 33 for c in value) or "\\" in value:
+        return None
+    try:
+        parts = urlsplit(value)
+        if parts.scheme == "miniapp" and parts.netloc == "open" and parts.path == "/1036":
+            params = _query(parts.query)
+            value = _one(params, ("url",)) if params is not None else None
+            if not value:
+                return None
+            parts = urlsplit(value)
+        token = re.fullmatch(r"/a/s/([0-9a-f]{32})/?", parts.path, re.IGNORECASE)
+        if (not token or parts.scheme != "https" or parts.hostname != "m.q.qq.com"
+                or parts.username is not None or parts.password is not None
+                or parts.port not in {None, 443} or parts.netloc.endswith(":")
+                or parts.fragment or "\\" in value or any(ord(c) < 33 for c in value)):
+            return None
+    except (ValueError, UnicodeError):
+        return None
+    share_id = token.group(1).lower()
+    return {"kind": "miniapp", "id": share_id, "url": "https://m.q.qq.com/a/s/" + share_id}
 
 
 class _Extractor:
@@ -218,11 +256,15 @@ class _Extractor:
     def text(self, value):
         value = self.string(value)
         if value is None:
-            return
+            return False
+        found = False
         for match in _URL_TEXT.finditer(html.unescape(value)):
-            self.add(parse_url(match.group().rstrip(_TRAILING)))
+            target = parse_url(match.group().rstrip(_TRAILING))
+            found |= target is not None
+            self.add(target)
             if len(self.result) >= self.limit:
                 break
+        return found
 
     def payload(self, value, depth: int):
         if not self.room(depth):
@@ -265,7 +307,7 @@ class _Extractor:
                 if kind in _SKIP_TYPES:
                     return
                 app = str(node.get("app", "")).lower()
-                mini |= kind in _MINI_TYPES or "miniapp" in app or "miniprogram" in app
+                mini |= kind in _MINI_TYPES or parent in _MINI_TYPES or "miniapp" in app or "miniprogram" in app
                 for index, (key, child) in enumerate(node.items()):
                     if index >= MAX_NODES or not self.room(level + 1):
                         break
@@ -276,7 +318,14 @@ class _Extractor:
                     if isinstance(child, str):
                         identity |= (key in _APP_KEYS | _APP_ID_KEYS and child.strip().lower() in _APP_IDS)
                         identity |= (key in {"name", "title"} and parent in {"source", "detail_1", "weappinfo"}
-                                     and child.strip() == "百度贴吧")
+                                     and child.strip() in {"贴吧", "百度贴吧"})
+                        if key == "ark_reserved1":
+                            reserved = self.string(child)
+                            if reserved:
+                                try:
+                                    collect(json.loads(reserved), level + 1, key)
+                                except (ValueError, RecursionError):
+                                    pass
                     elif isinstance(child, (Mapping, list, tuple)):
                         collect(child, level + 1, key)
             elif isinstance(node, (list, tuple)):
@@ -284,17 +333,26 @@ class _Extractor:
                     collect(child, level + 1, parent)
 
         collect(root, depth)
+        direct = False
+        shares = []
         for key, child in entries[:MAX_NODES]:
             if key in _URL_KEYS:
-                self.text(child)
+                direct |= self.text(child)
+                if identity and mini:
+                    shares.append(parse_miniapp_share_url(child))
             elif key in _PAGE_KEYS and identity:
                 path = self.string(child)
                 if path:
-                    self.add(_mini_target(path))
+                    target = _mini_target(path)
+                    direct |= target is not None
+                    self.add(target)
             elif key in {"data", "json", "xml"} and isinstance(child, str):
                 self.payload(child, depth + 1)
             elif key in _MESSAGE_KEYS and not mini:
                 self.message(child, depth + 1)
+        if not direct:
+            for share in shares:
+                self.add(share)
 
     def xml(self, value: str, depth: int):
         if "<!DOCTYPE" in value.upper() or "<!ENTITY" in value.upper():
@@ -317,7 +375,7 @@ class _Extractor:
                 key = key.lower()
                 fields.append((key, child))
                 identity |= (key in _APP_KEYS | _APP_ID_KEYS and child.strip().lower() in _APP_IDS)
-                identity |= (key == "name" and tag in {"source", "weappinfo"} and child.strip() == "百度贴吧")
+                identity |= (key == "name" and tag in {"source", "weappinfo"} and child.strip() in {"贴吧", "百度贴吧"})
             if element.text:
                 fields.append((tag, element.text))
                 identity |= tag in _APP_KEYS | _APP_ID_KEYS and element.text.strip().lower() in _APP_IDS

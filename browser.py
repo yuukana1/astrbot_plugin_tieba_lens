@@ -28,6 +28,7 @@ MAX_HEIGHT = 30_000
 INSTALL_TIMEOUT = 1800
 TEMP_RETENTION = 600
 IDLE_TIMEOUT = 45
+CLOSE_TIMEOUT = 3
 ENGINES = {"headless": "精简 Chromium", "chromium": "完整 Chromium"}
 _NO_ANIMATIONS = "<style>*,*::before,*::after{animation:none!important;transition:none!important;caret-color:transparent!important}</style>"
 
@@ -56,6 +57,15 @@ def _missing_libraries(exc: Exception) -> bool:
     message = str(exc).lower()
     return any(part in message for part in ("error while loading shared libraries",
                "host system is missing dependencies", "missing libraries:"))
+
+
+def _recoverable_browser_error(exc: Exception) -> bool:
+    """Only a dead/hung browser warrants a fresh, bounded capture attempt."""
+    message = str(exc).lower()
+    return (isinstance(exc, TimeoutError) or type(exc).__name__ == "TimeoutError"
+            or any(part in message for part in ("page crashed", "target crashed",
+                "target page, context or browser has been closed", "browser has been closed",
+                "browser disconnected", "connection closed while reading from the driver")))
 
 
 def _can_install_libraries() -> bool:
@@ -403,7 +413,6 @@ class LocalRenderer:
         async with self._slots:
             await self._begin_work()
             try:
-                browser = await self._ensure_browser(engine, prefer_system=prefer_system)
                 html = self._render_html(template, data)
                 # add_style_tag can wait forever when page JavaScript is disabled.
                 # Insert static CSS before parsing instead; preserve the doctype.
@@ -417,7 +426,24 @@ class LocalRenderer:
                 self._active_paths.add(path)
                 self.stage = "正在本地排版并生成卡片。"
                 try:
-                    await asyncio.wait_for(self._capture(browser, html, width, timeout, path), timeout / 1000 + 5)
+                    for attempt in range(2):
+                        try:
+                            browser = await self._ensure_browser(engine, prefer_system=prefer_system)
+                            await asyncio.wait_for(self._capture(browser, html, width, timeout, path), timeout / 1000 + 5)
+                            break
+                        except Exception as exc:
+                            if not _recoverable_browser_error(exc):
+                                raise
+                            # A crashed page can leave a connected but unusable
+                            # browser/driver. Dispose it before the next job too.
+                            async with self._start_lock:
+                                await self._dispose_runtime()
+                            path.unlink(missing_ok=True)
+                            if attempt:
+                                raise
+                            self.stage = "浏览器意外退出或超时，正在恢复并重试一次。"
+                            logger.warning("[贴吧拾光] 本地浏览器异常，释放后重试一次：%s", type(exc).__name__)
+                            await asyncio.sleep(0.2)
                     if not path.is_file():
                         raise RuntimeError("本地图片渲染未生成截图文件。")
                     self.stage = "本地卡片生成完成。"
@@ -451,9 +477,10 @@ class LocalRenderer:
             await page.screenshot(path=str(path), type="png", full_page=True,
                 animations="disabled", scale="css", timeout=timeout)
         finally:
-            with contextlib.suppress(Exception):
-                await context.close()
-            self._contexts.discard(context)
+            try:
+                await self._close_resource(context.close(), "页面上下文")
+            finally:
+                self._contexts.discard(context)
 
     async def close(self):
         self._closed = True
@@ -471,12 +498,25 @@ class LocalRenderer:
     async def _dispose_runtime(self):
         contexts = tuple(self._contexts)
         self._contexts.clear()
-        await asyncio.gather(*(context.close() for context in contexts), return_exceptions=True)
-        if self._browser is not None:
-            with contextlib.suppress(Exception):
-                await self._browser.close()
-            self._browser = None
-        if self._playwright is not None:
-            with contextlib.suppress(Exception):
-                await self._playwright.stop()
-            self._playwright = None
+        browser, playwright = self._browser, self._playwright
+        # Detach stale resources before awaiting their shutdown. A failed close
+        # must not leave the next capture reusing a broken browser or driver.
+        self._browser = self._playwright = None
+        self._browser_engine = None
+        try:
+            await asyncio.gather(*(self._close_resource(context.close(), "页面上下文")
+                                   for context in contexts))
+        finally:
+            try:
+                if browser is not None:
+                    await self._close_resource(browser.close(), "浏览器")
+            finally:
+                if playwright is not None:
+                    await self._close_resource(playwright.stop(), "浏览器驱动")
+
+    @staticmethod
+    async def _close_resource(operation, label):
+        try:
+            await asyncio.wait_for(operation, CLOSE_TIMEOUT)
+        except Exception as exc:
+            logger.debug("[贴吧拾光] %s 关闭未完成：%s", label, type(exc).__name__)

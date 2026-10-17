@@ -27,17 +27,18 @@ import astrbot.api.message_components as Comp
 
 from .client import TiebaClient, sort_document
 from .browser import LocalRenderer
-from .delivery import is_upload_failure, send_with_retry
+from .delivery import is_confirmed_upload_failure, is_upload_failure, send_with_retry
 from .fonts import FontStore
 from .links import extract_targets, parse_url
 from .media import download_originals
+from .miniapp import resolve_target
 from .renderer import CardRenderer
 from .render_service import RenderManager, RendererUnavailable
 from .settings import ENUMS, GROUP_KEYS, effective_settings, public_settings, validate_patch
 from .storage import Store, cache_key
 
 PLUGIN_NAME = "astrbot_plugin_tieba_lens"
-VERSION = "1.2.0"
+VERSION = "1.2.1"
 JOB_ID = re.compile(r"[0-9a-f]{24}\Z")
 ACTIVE = {"queued", "fetching", "rendering", "sending"}
 PARSE_KEYS = GROUP_KEYS | {"image_width", "page_height", "max_pages"}
@@ -106,10 +107,15 @@ class TiebaLens(Star):
         self.locks: dict[str, dict] = {}
         self.recent: OrderedDict[str, float] = OrderedDict()
         self.cooldowns: OrderedDict[str, float] = OrderedDict()
+        self.pending_links: set[str] = set()
         self.settings_lock = asyncio.Lock()
         self.submit_lock = asyncio.Lock()
+        self.dispatch_lock = asyncio.Lock()
         self.clients_lock = asyncio.Lock()
         self.artifact_lock = asyncio.Lock()
+        # Fetch jobs may overlap; image decoding, browser capture and PNG
+        # encoding share one slot to bound peak memory across both backends.
+        self.render_lock = asyncio.Lock()
         self.semaphore = asyncio.Semaphore(4)
         self.in_flight = 0
         self.cleanup_task = None
@@ -118,8 +124,19 @@ class TiebaLens(Star):
 
     async def initialize(self):
         await asyncio.to_thread(self.store.recover)
+        await self._restore_delivery_guards()
         self.cleanup_task = asyncio.create_task(self._cleanup_loop())
         logger.info("[贴吧拾光] v%s 已启动，中文控制台及自动解析已就绪", VERSION)
+
+    async def _restore_delivery_guards(self):
+        wall, monotonic = time.time(), time.monotonic()
+        for job in await asyncio.to_thread(self.store.list_jobs, 1000):
+            origin, url = job.get("delivery_origin"), job.get("dedup_url")
+            expiry = job.get("dedup_until", 0)
+            if (origin and url and isinstance(expiry, (int, float)) and expiry > wall
+                    and (job.get("delivery_status") in {"sent", "unknown"} or job.get("sent_messages", 0) > 0)):
+                duration = job.get("dedup_seconds", self.settings()["dedup_seconds"])
+                self.recent[str(origin) + "|" + str(url)] = monotonic - max(0, duration - min(3600, expiry - wall))
 
     async def terminate(self):
         self.stopping = True
@@ -202,7 +219,7 @@ class TiebaLens(Star):
     async def _get_job(self, job_id: str) -> dict | None:
         if not JOB_ID.fullmatch(str(job_id)):
             return None
-        if job_id in self.tasks and job_id in self.jobs:
+        if job_id in self.jobs and (job_id in self.tasks or self.jobs[job_id].get("persistence_error")):
             return self.jobs[job_id]
         return await asyncio.to_thread(self.store.get_job, job_id)
 
@@ -232,6 +249,8 @@ class TiebaLens(Star):
             raise ValueError("任务队列已满，请稍后再试")
         jid = uuid.uuid4().hex[:24]
         job = {"id": jid, "status": "queued", "stage": "等待处理", "progress": 0,
+               "delivery_origin": str(event.unified_msg_origin) if event else "", "dedup_url": target["url"],
+               "dedup_seconds": options["dedup_seconds"], "dedup_until": 0,
                "input": input_text or target["url"], "title": "正在读取贴吧内容", "kind": target.get("kind", "thread"),
                "started_at": now(), "finished_at": None, "error": None, "warnings": [],
                "pages": 0, "original_count": 0, "source_url": target["url"], "cache_hit": False,
@@ -239,7 +258,7 @@ class TiebaLens(Star):
                                              if k not in {"cookie", "blacklist", "group_overrides"}}}
         self.jobs[jid] = job
         await self._save(job)
-        await asyncio.to_thread(self.store.increment, "total")
+        await self._increment_stat("total")
         task = asyncio.create_task(self._run(job, target, copy.deepcopy(options), event))
         self.tasks[jid] = task
         task.add_done_callback(lambda _: self.tasks.pop(jid, None))
@@ -247,6 +266,7 @@ class TiebaLens(Star):
 
     async def _run(self, job: dict, target: dict, settings: dict, event):
         started = time.monotonic()
+        dedup_url = target["url"]
         client_key = None
         last_reaction = ""
         admitted = False
@@ -265,6 +285,11 @@ class TiebaLens(Star):
                     await asyncio.sleep(0.15)
                 self.in_flight += 1
                 admitted = True
+                if target.get("kind") == "miniapp":
+                    job["status"] = "fetching"
+                    await progress("还原贴吧小程序地址", 5)
+                    target = await resolve_target(target, event)
+                    job.update(kind=target["kind"], source_url=target["url"])
                 key = cache_key(target, settings)
                 entry = self.locks.setdefault(key, {"lock": asyncio.Lock(), "users": 0})
                 entry["users"] += 1
@@ -272,14 +297,21 @@ class TiebaLens(Star):
                     async with entry["lock"]:
                         job["status"] = "fetching"
                         await progress("读取帖子和回复", 10)
-                        document = await asyncio.to_thread(self.store.get_cache, key) if settings["cache_minutes"] else None
+                        try:
+                            document = await asyncio.to_thread(self.store.get_cache, key) if settings["cache_minutes"] else None
+                        except Exception as exc:
+                            logger.warning("[贴吧拾光] 内容缓存暂不可读，将重新读取：%s", type(exc).__name__)
+                            document = None
                         if document:
                             job["cache_hit"] = True
-                            await asyncio.to_thread(self.store.increment, "cache_hits")
+                            await self._increment_stat("cache_hits")
                         else:
                             client_key, client = await self._client(settings)
                             document = await asyncio.wait_for(client.parse(target, settings, progress), timeout=240)
-                            await asyncio.to_thread(self.store.put_cache, key, document, settings["cache_minutes"])
+                            try:
+                                await asyncio.to_thread(self.store.put_cache, key, document, settings["cache_minutes"])
+                            except Exception as exc:
+                                logger.warning("[贴吧拾光] 内容缓存暂未写入，继续生成卡片：%s", type(exc).__name__)
                 finally:
                     entry["users"] -= 1
                     if entry["users"] == 0:
@@ -289,9 +321,11 @@ class TiebaLens(Star):
                 document = copy.deepcopy(document)
                 sort_document(document, settings)
                 job.update(title=document.get("title", "贴吧内容"), kind=document.get("kind", "thread"),
-                           source_url=document.get("url", target["url"]), status="rendering")
-                await progress("排版图文卡片", 78)
-                files = await asyncio.wait_for(self.renderer.render(document, settings, job["id"]), timeout=420)
+                           source_url=document.get("url", target["url"]), status="rendering", document=document)
+                await progress("等待图文排版", 75)
+                async with self.render_lock:
+                    await progress("排版图文卡片", 78)
+                    files = await asyncio.wait_for(self.renderer.render(document, settings, job["id"]), timeout=420)
                 if not files:
                     raise RuntimeError("渲染服务没有返回图片")
                 validated = []
@@ -316,13 +350,17 @@ class TiebaLens(Star):
                     await self._send(event, job, settings)
                     job["delivery_status"] = "sent"
                 job.update(status="done", stage="解析完成", progress=100, finished_at=now())
-                await asyncio.to_thread(self.store.increment, "success")
+                await self._increment_stat("success")
                 if event:
                     if last_reaction:
                         await self._react(event, settings, last_reaction, False)
                     await self._react(event, settings, settings["reaction_done"], True)
                     last_reaction = ""
         except asyncio.CancelledError:
+            if job.get("delivery_status") == "sent":
+                # Shutdown may interrupt the optional completion reaction
+                # after QQ has already acknowledged every message.
+                raise
             delivery = job.get("status") == "sending"
             job.update(status="delivery_failed" if delivery else "failed", stage="发送已中断" if delivery else "任务已中断",
                        error="插件已停止或重载；发送结果可能未知，请核对聊天记录。" if delivery else "插件已停止或重载，可重试。", finished_at=now())
@@ -335,14 +373,14 @@ class TiebaLens(Star):
             if delivery and isinstance(exc, TimeoutError):
                 message = "等待 QQ 发送响应超时，发送结果未知，请先核对聊天记录。"
             if delivery:
-                job["delivery_status"] = "failed" if is_upload_failure(exc) else "unknown"
+                job["delivery_status"] = "failed" if is_confirmed_upload_failure(exc) else "unknown"
             job.update(status="delivery_failed" if delivery else "failed", stage="卡片已生成，发送失败" if delivery else ("渲染环境未就绪" if isinstance(exc, RendererUnavailable) else "解析失败"),
                        error=message, finished_at=now(), progress=100 if delivery else job["progress"])
-            await asyncio.to_thread(self.store.increment, "failed")
+            await self._increment_stat("failed")
             logger.warning("[贴吧拾光] 任务 %s 失败：%s", job["id"], message)
             if event:
-                if not delivery or (is_upload_failure(exc) and not job.get("sent_messages")):
-                    self.recent.pop(str(event.unified_msg_origin) + "|" + target["url"], None)
+                if not delivery or (is_confirmed_upload_failure(exc) and not job.get("sent_messages")):
+                    self.recent.pop(str(event.unified_msg_origin) + "|" + dedup_url, None)
                 if last_reaction:
                     await self._react(event, settings, last_reaction, False)
                 await self._react(event, settings, settings["reaction_failed"], True)
@@ -351,10 +389,12 @@ class TiebaLens(Star):
                     if delivery:
                         notice = ("贴吧内容已解析并生成卡片，但 QQ 图片发送未完成。\n"
                                   "结果已保留，可在贴吧拾光面板预览或下载。")
-                        if job.get("sent_messages") or not is_upload_failure(exc):
+                        if job.get("sent_messages") or not is_confirmed_upload_failure(exc):
                             notice += "\n部分消息可能已经送达，请先核对聊天记录。"
-                        else:
+                        elif is_upload_failure(exc):
                             notice += "\n图片上传连接超时，已自动重试；可稍后重新发送链接。"
+                        else:
+                            notice += "\nQQ 未接受本次图片，请查看任务中的错误原因，处理后可重新发送链接。"
                     elif isinstance(exc, RendererUnavailable):
                         notice = str(exc)
                     else:
@@ -368,8 +408,27 @@ class TiebaLens(Star):
             if event and last_reaction:
                 await self._react(event, settings, last_reaction, False)
             job["duration_ms"] = int((time.monotonic() - started) * 1000)
-            await self._save(job)
+            if event:
+                scope_key = str(event.unified_msg_origin) + "|" + dedup_url
+                self.pending_links.discard(scope_key)
+                if job.get("delivery_status") in {"sent", "unknown"} or job.get("sent_messages", 0) > 0:
+                    self.recent[scope_key] = time.monotonic()
+                    self.recent.move_to_end(scope_key)
+                    job["dedup_until"] = time.time() + settings["dedup_seconds"]
+                else:
+                    self.recent.pop(scope_key, None)
+            try:
+                await self._save(job)
+            except Exception as exc:
+                job["persistence_error"] = True
+                logger.warning("[贴吧拾光] 任务 %s 最终记录暂未写入：%s", job["id"], self._safe_error(exc, settings))
             self._trim_memory()
+
+    async def _increment_stat(self, name: str):
+        try:
+            await asyncio.to_thread(self.store.increment, name)
+        except Exception as exc:
+            logger.warning("[贴吧拾光] 任务计数暂未写入：%s", type(exc).__name__)
 
     @staticmethod
     def _safe_error(exc: Exception, settings: dict) -> str:
@@ -415,7 +474,12 @@ class TiebaLens(Star):
                     raise
             await send_with_retry(send)
             job["sent_messages"] = job.get("sent_messages", 0) + 1
-            await self._save(job)
+            try:
+                await self._save(job)
+            except Exception as exc:
+                # QQ has acknowledged this message. A ledger write cannot
+                # turn it into a failed send or replay previously sent pages.
+                logger.warning("[贴吧拾光] 任务 %s 发送记录暂未写入：%s", job["id"], self._safe_error(exc, settings))
 
         if forward and has_onebot:
             title = f"{job['title']}\n共 {len(files)} 页"
@@ -471,6 +535,10 @@ class TiebaLens(Star):
                     (gid or settings["allow_private"]))
 
     async def _dispatch_message(self, event, targets: list[dict], settings: dict, *, manual: bool) -> bool:
+        async with self.dispatch_lock:
+            return await self._dispatch_message_locked(event, targets, settings, manual=manual)
+
+    async def _dispatch_message_locked(self, event, targets: list[dict], settings: dict, *, manual: bool) -> bool:
         scope = str(event.unified_msg_origin)
         current = time.monotonic()
         accepted = False
@@ -484,17 +552,23 @@ class TiebaLens(Star):
             return True
         for target in targets:
             key = scope + "|" + target["url"]
-            if current - self.recent.get(key, 0) < settings["dedup_seconds"]:
+            if key in self.pending_links or current - self.recent.get(key, 0) < settings["dedup_seconds"]:
                 if manual:
                     await event.send(event.plain_result("这条链接刚刚解析过，稍后可再次解析。"))
                 accepted = True
                 continue
             try:
+                self.pending_links.add(key)
                 await self.submit(target, settings, event=event)
             except ValueError as exc:
+                self.pending_links.discard(key)
                 await event.send(event.plain_result(str(exc)))
                 return True
+            except BaseException:
+                self.pending_links.discard(key)
+                raise
             self.recent[key] = current
+            self.recent.move_to_end(key)
             self.cooldowns[scope] = current
             accepted = True
         return accepted

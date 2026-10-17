@@ -1,0 +1,4 @@
+# These files remain available in the repository and README's online preview.
+/tests export-ignore
+/docs/images export-ignore
+/.gitattributes export-ignore

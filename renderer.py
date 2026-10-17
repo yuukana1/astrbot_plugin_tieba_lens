@@ -23,6 +23,7 @@ from urllib.parse import urljoin, urlsplit
 import httpx
 from PIL import Image, ImageDraw, ImageFont, ImageOps
 
+from .bundled_fonts import BUNDLED_FONT_FILENAME, BundledFontCache
 from .fonts import FontStore
 
 _CDN_HOSTS = {
@@ -77,9 +78,9 @@ _THEME_FONTS = {
     "bilibili": "lxgw",
 }
 
-# 字体资源（base64 子集 woff2，由 _load_font_assets 注入 HTML）
+# 完整离线字体源；HTML 按本次卡片全部文字生成临时子集。
 _FONT_FILES = {
-    "lxgw": "LXGWWenKaiScreen-Subset.woff2",
+    "lxgw": BUNDLED_FONT_FILENAME,
 }
 _FONT_FAMILIES = {
     "lxgw": "LXGW WenKai Screen",
@@ -208,8 +209,8 @@ class CardRenderer:
         self.render_html = render_html
         self.data_root = Path(data_root)
         self.template = (Path(__file__).parent / "templates" / "card.html").read_text(encoding="utf-8")
-        self._font_assets = self._load_font_assets()
         self.fonts = FontStore(self.data_root)
+        self._bundled_font = BundledFontCache(self.data_root)
         self._theme_art_assets = self._load_theme_art_assets()
 
     @staticmethod
@@ -226,22 +227,6 @@ class CardRenderer:
                     asset.verify()
                 result[theme] = "data:image/png;base64," + base64.b64encode(body).decode("ascii")
             except (OSError, ValueError, Image.DecompressionBombError):
-                continue
-        return result
-
-    @staticmethod
-    def _load_font_assets() -> dict[str, str]:
-        """Read subset woff2 fonts and base64-encode them for @font-face data URIs."""
-        fonts_dir = Path(__file__).parent / "templates" / "fonts"
-        result: dict[str, str] = {}
-        for key, filename in _FONT_FILES.items():
-            path = fonts_dir / filename
-            if not path.is_file():
-                continue
-            try:
-                body = path.read_bytes()
-                result[key] = "data:font/woff2;base64," + base64.b64encode(body).decode("ascii")
-            except OSError:
                 continue
         return result
 
@@ -266,8 +251,8 @@ class CardRenderer:
         custom = await asyncio.to_thread(self.fonts.load) if font_key == "custom" else None
         if font_key == "custom" and not custom:
             font_key = "lxgw"
-        # 仅注入一款字体（减少 HTML 体积）
-        font_face_src = self._font_assets.get(font_key, "")
+        font_face_src = ""
+        fallback_font_face_src = ""
         if custom:
             metadata, font_data = custom
             font_format = metadata["format"]
@@ -299,9 +284,20 @@ class CardRenderer:
                 "font_family": font_family,
                 "font_key": font_key,
                 "font_format": font_format,
-                "fallback_font_face_src": self._font_assets.get("lxgw", "") if font_key == "custom" else "",
+                "fallback_font_face_src": fallback_font_face_src,
                 "theme_art_src": self._theme_art_assets.get(theme, ""),
             }
+
+        # One complete character set covers the whole job, including template
+        # labels, all pages, generated placeholders, names, and diagnostics.
+        # Keep font parsing/compression and its bounded LRU off the event loop.
+        subset = await asyncio.to_thread(self._bundled_font.subset_for_context,
+                                        self.template, make_context(blocks, 0, 1))
+        default_font_src = "data:font/woff2;base64," + base64.b64encode(subset).decode("ascii")
+        if custom:
+            fallback_font_face_src = default_font_src
+        else:
+            font_face_src = default_font_src
 
         async def capture_chunk(chunk: list[dict], index: int, total: int) -> Image.Image:
             rendered_path = await self.render_html(self.template, make_context(chunk, index, total), {
@@ -413,13 +409,16 @@ class CardRenderer:
         for warning in warnings:
             if warning not in original_warnings:
                 original_warnings.append(warning)
+        # Pillow does not decode WOFF2. Keep its complete SFNT outside the
+        # plugin checkout and reuse it across jobs and plugin restarts.
+        font_path = await asyncio.to_thread(self._bundled_font.sfnt_path)
         output: list[str] = []
         for index, raw_path in enumerate(captured):
             with Image.open(raw_path) as page:
                 final = self._footer(page, width, _THEMES[theme], index + 1, len(captured),
                                      str(doc.get("url") or "") if opts.get("show_source") and index + 1 == len(captured) else None,
                                      bool(opts.get("show_source")) and limited and index + 1 == len(captured), max_pages,
-                                     font_key=font_key, font_data=font_data)
+                                     font_key=font_key, font_data=font_data, font_path=font_path)
             target = root / f"page-{index + 1:03d}.png"
             try:
                 final.save(target, "PNG", optimize=True)
@@ -485,6 +484,7 @@ class CardRenderer:
         downloaded = 0
         semaphore = asyncio.Semaphore(4)
         lock = asyncio.Lock()
+        normalize_lock = asyncio.Lock()
 
         async def download(original: str, kind: str) -> None:
             nonlocal total_bytes, downloaded
@@ -523,7 +523,11 @@ class CardRenderer:
                                 body.extend(chunk)
                                 if len(body) > _MAX_ASSET_BYTES or time.monotonic() - start > _ASSET_SECONDS:
                                     return
-                            normalized = await asyncio.to_thread(self._normalize_asset, bytes(body), kind, width)
+                            # Large RGBA decodes can occupy several copies of
+                            # the original image. Download in parallel, but keep
+                            # only one Pillow normalization active per job.
+                            async with normalize_lock:
+                                normalized = await asyncio.to_thread(self._normalize_asset, bytes(body), kind, width)
                             if normalized:
                                 result[original] = normalized
                                 downloaded += 1
@@ -840,36 +844,26 @@ class CardRenderer:
                     pass
 
     @staticmethod
-    def _font(size: int, font_key: str = "lxgw", font_data: bytes | None = None):
+    def _font(size: int, font_key: str = "lxgw", font_data: bytes | None = None,
+              font_path: Path | None = None):
         # The footer uses the same font snapshot as the HTML body.
         if font_key == "custom" and font_data:
             try:
                 return ImageFont.truetype(io.BytesIO(font_data), size)
             except OSError:
                 pass
-        plugin_fonts = {"lxgw": "LXGWWenKaiScreen.ttf"}
-        fonts_dir = Path(__file__).parent / "templates" / "fonts"
-        preferred = plugin_fonts.get(font_key)
-        candidates: list[str] = []
-        if preferred:
-            candidates.append(str(fonts_dir / preferred))
-        # 其余插件字体也作备选
-        for name in plugin_fonts.values():
-            p = str(fonts_dir / name)
-            if p not in candidates:
-                candidates.append(p)
-        for candidate in candidates:
-            if Path(candidate).is_file():
-                try:
-                    return ImageFont.truetype(candidate, size)
-                except OSError:
-                    continue
+        if font_path is not None:
+            try:
+                return ImageFont.truetype(str(font_path), size)
+            except OSError:
+                pass
         return ImageFont.load_default()
 
     @classmethod
     def _footer(cls, page: Image.Image, width: int, colors: dict, number: int, total: int,
-                source: str | None, limited: bool, max_pages: int, font_key: str = "lxgw", font_data: bytes | None = None) -> Image.Image:
-        url_font = cls._font(13, font_key, font_data)
+                source: str | None, limited: bool, max_pages: int, font_key: str = "lxgw",
+                font_data: bytes | None = None, font_path: Path | None = None) -> Image.Image:
+        url_font = cls._font(13, font_key, font_data, font_path)
         url_lines: list[str] = []
         line = ""
         for character in ((source or "来源未提供") if source is not None else ""):
@@ -880,7 +874,7 @@ class CardRenderer:
         if line:
             url_lines.append(line)
         warning_lines: list[str] = []
-        warning_font = cls._font(17, font_key, font_data)
+        warning_font = cls._font(17, font_key, font_data, font_path)
         if limited:
             line = ""
             for character in f"已达 {max_pages} 页上限，后续内容未收录。请打开原帖或提高页数上限。":
@@ -899,7 +893,7 @@ class CardRenderer:
         draw = ImageDraw.Draw(final)
         y = page.height + 12
         if page_label:
-            label_font = cls._font(15, font_key, font_data)
+            label_font = cls._font(15, font_key, font_data, font_path)
             draw.text((width - 35 - draw.textlength(page_label,font=label_font), y), page_label, font=label_font, fill=colors["muted"])
             y += 24
         # Retain the complete source URL; wrap instead of ellipsizing a source.

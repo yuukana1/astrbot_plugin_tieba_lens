@@ -35,6 +35,48 @@ class ActionFailed(Exception):
 
 
 class DeliveryTests(unittest.IsolatedAsyncioTestCase):
+    def test_confirmed_upload_failures_include_transport_and_permanent_errors(self):
+        for wording in (
+            SNOWLUMA,
+            NAPCAT,
+            "图片上传失败: 文件格式不支持",
+            "富媒体上传失败: file not found",
+            "highway upload failed: invalid image format",
+            "media upload failed: file does not exist",
+            "图片上传失败: permission denied while opening file",
+        ):
+            with self.subTest(wording=wording):
+                self.assertTrue(delivery.is_confirmed_upload_failure(ActionFailed(wording)))
+
+    def test_confirmed_upload_failure_accepts_sdk_envelopes_and_message_fallback(self):
+        result_error = RuntimeError("opaque error")
+        result_error.result = {"retcode": 100, "message": "图片上传失败: 文件格式不支持"}
+        result_error.info = {"retcode": 1200, "wording": "not the authoritative envelope"}
+        self.assertTrue(delivery.is_confirmed_upload_failure(result_error))
+
+        info_error = ActionFailed("富媒体上传失败: file not found")
+        info_error.result = None
+        self.assertTrue(delivery.is_confirmed_upload_failure(info_error))
+
+    def test_unconfirmed_errors_do_not_prove_an_upload_failure(self):
+        for error in (
+            TimeoutError("OneBot API response timeout"),
+            ConnectionError("WebSocket disconnected while waiting for response"),
+            FileNotFoundError("image upload failed: local file not found"),
+            RuntimeError(SNOWLUMA),
+            ActionFailed("send_group_msg API response timeout"),
+            ActionFailed("WebSocket connection closed"),
+            ActionFailed("群内已禁言"),
+            ActionFailed("权限不足，无法发送消息"),
+            ActionFailed("账号受到风控，消息发送失败"),
+            ActionFailed("TCP connect timeout"),
+            ActionFailed("image upload completed; send_group_msg failed: connect timeout"),
+            ActionFailed(SNOWLUMA, retcode=1200),
+            ActionFailed(SNOWLUMA, retcode="100"),
+        ):
+            with self.subTest(error=str(error)):
+                self.assertFalse(delivery.is_confirmed_upload_failure(error))
+
     def test_snowluma_explicit_upload_connect_failure_is_retryable(self):
         self.assertTrue(delivery.is_upload_failure(ActionFailed(SNOWLUMA)))
 
@@ -127,6 +169,26 @@ class DeliveryTests(unittest.IsolatedAsyncioTestCase):
                 send = AsyncMock(side_effect=error)
                 sleep = AsyncMock()
                 with self.assertRaises(type(error)) as raised:
+                    await delivery.send_with_retry(send, sleep=sleep)
+                self.assertIs(raised.exception, error)
+                send.assert_awaited_once_with()
+                sleep.assert_not_awaited()
+
+    async def test_permanent_confirmed_upload_failures_are_not_retried(self):
+        for wording in (
+            "图片上传失败: 文件格式不支持",
+            "富媒体上传失败: file not found",
+            "highway upload failed: invalid image format",
+            "图片上传失败: permission denied; connect timeout",
+            "图片上传失败: 账号风控; connect ETIMEDOUT",
+        ):
+            with self.subTest(wording=wording):
+                error = ActionFailed(wording)
+                self.assertTrue(delivery.is_confirmed_upload_failure(error))
+                self.assertFalse(delivery.is_upload_failure(error))
+                send = AsyncMock(side_effect=error)
+                sleep = AsyncMock()
+                with self.assertRaises(ActionFailed) as raised:
                     await delivery.send_with_retry(send, sleep=sleep)
                 self.assertIs(raised.exception, error)
                 send.assert_awaited_once_with()

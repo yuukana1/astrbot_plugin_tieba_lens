@@ -131,6 +131,7 @@ class Store:
                            error="发送结果可能未知，请核对聊天记录；已保留生成结果。" if delivery else "插件上次停止时任务尚未完成，请点击重新解析。")
                 if delivery:
                     job["delivery_status"] = "unknown"
+                    job["dedup_until"] = time.time() + min(3600, max(0, job.get("dedup_seconds", 120)))
                 self.save_job(job)
 
     def cleanup(self, hours: int, max_mb: int, active_ids: set[str]) -> dict:

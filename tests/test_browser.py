@@ -94,6 +94,80 @@ class LocalRendererTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(self.renderer._contexts)
         self.browser.close.assert_not_awaited()
 
+    async def test_crashed_page_restarts_runtime_once_and_recovers(self):
+        self.renderer._capture = AsyncMock(side_effect=[RuntimeError('Page.set_content: Page crashed'), None])
+        async def capture(browser, html, width, timeout, path):
+            if self.renderer._capture.await_count == 1:
+                raise RuntimeError('Page.set_content: Page crashed')
+            path.write_bytes(b'recovered-png')
+        self.renderer._capture.side_effect = capture
+        path = await self.render()
+        self.assertEqual(Path(path).read_bytes(), b'recovered-png')
+        self.assertEqual(self.renderer._capture.await_count, 2)
+        self.assertEqual(self.playwright.chromium.launch.await_count, 2)
+        self.playwright.stop.assert_awaited_once()
+        self.assertFalse(self.renderer._active_paths)
+
+    async def test_repeated_crash_is_bounded_and_discards_dead_runtime(self):
+        self.renderer._capture = AsyncMock(side_effect=RuntimeError('Page crashed'))
+        with self.assertRaisesRegex(RuntimeError, 'Page crashed'):
+            await self.render()
+        self.assertEqual(self.renderer._capture.await_count, 2)
+        self.assertIsNone(self.renderer._browser)
+        self.assertIsNone(self.renderer._playwright)
+        self.assertFalse(self.renderer._active_paths)
+        self.assertEqual(list((self.root/'render_tmp').glob('*.png')), [])
+
+    async def test_transient_browser_launch_timeout_restarts_driver_once(self):
+        self.playwright.chromium.launch.side_effect = [TimeoutError('launch timed out'), self.browser]
+        path = await self.render()
+        self.assertTrue(Path(path).is_file())
+        self.assertEqual(self.playwright.chromium.launch.await_count, 2)
+        self.playwright.stop.assert_awaited_once()
+
+    async def test_crashed_capture_with_hung_context_close_still_recovers(self):
+        async def hang():
+            await asyncio.Event().wait()
+        async def make_context(**options):
+            context = await self.browser.make_context(**options)
+            if len(self.browser.contexts) == 1:
+                context.page.set_content.side_effect = RuntimeError('Page crashed')
+                context.close.side_effect = hang
+            return context
+        self.browser.new_context.side_effect = make_context
+        with patch.object(browser_module, 'CLOSE_TIMEOUT', 0.01):
+            path = await asyncio.wait_for(self.render(), 1)
+        self.assertTrue(Path(path).is_file())
+        self.assertEqual(len(self.browser.contexts), 2)
+        self.assertFalse(self.renderer._contexts)
+        self.playwright.stop.assert_awaited_once()
+
+    async def test_hung_browser_and_driver_close_release_references_and_locks(self):
+        await self.render()
+        async def hang():
+            await asyncio.Event().wait()
+        self.browser.close.side_effect = hang
+        self.playwright.stop.side_effect = hang
+        with patch.object(browser_module, 'CLOSE_TIMEOUT', 0.01):
+            await asyncio.wait_for(self.renderer.close(), 0.5)
+        self.assertIsNone(self.renderer._browser)
+        self.assertIsNone(self.renderer._playwright)
+        self.assertFalse(self.renderer._start_lock.locked())
+        self.playwright.stop.assert_awaited_once()
+
+    async def test_hung_capture_restarts_but_cancellation_never_retries(self):
+        async def capture(browser, html, width, timeout, path):
+            if self.renderer._capture.await_count == 1:
+                raise TimeoutError('capture deadline exceeded')
+            path.write_bytes(b'recovered')
+        self.renderer._capture = AsyncMock(side_effect=capture)
+        await self.render()
+        self.assertEqual(self.renderer._capture.await_count, 2)
+        self.renderer._capture = AsyncMock(side_effect=asyncio.CancelledError())
+        with self.assertRaises(asyncio.CancelledError):
+            await self.render()
+        self.assertEqual(self.renderer._capture.await_count, 1)
+
     async def test_blocks_http_https_disables_page_javascript_and_preserves_png_contract(self):
         await self.render(viewport_width=800, timeout=10000)
         options = self.browser.new_context.call_args.kwargs

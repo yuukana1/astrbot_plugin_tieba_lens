@@ -173,6 +173,51 @@ class IntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue((await self.finish(other))["cache_hit"])
         self.assertEqual(self.client.parse.await_count, 1)
 
+    async def test_miniapp_automatic_parse_shares_canonical_cache(self):
+        from astrbot_plugin_tieba_lens.tests.test_miniapp import card, response, POST
+        receiver = Receiver([C.Json(data=card())])
+        receiver.message_str = ''
+        receiver.bot.call_action.return_value = response()
+        await self.plugin.on_message(receiver)
+        self.assertTrue(receiver.stopped)
+        tasks = list(self.plugin.tasks.values())
+        self.assertEqual(len(tasks), 1)
+        await asyncio.gather(*tasks)
+        result = list(self.plugin.jobs.values())[0]
+        self.assertEqual(result['status'], 'done')
+        self.assertEqual(result['source_url'], POST['url'])
+        self.assertEqual(self.client.parse.await_args.args[0], POST)
+        direct = await self.finish(await self.plugin.submit(POST, self.plugin.settings()))
+        self.assertTrue(direct['cache_hit'])
+        self.assertEqual(self.client.parse.await_count, 1)
+        self.assertTrue(receiver.sent)
+
+    async def test_failed_miniapp_query_allows_retry_and_never_parses(self):
+        from astrbot_plugin_tieba_lens.tests.test_miniapp import card, TARGET
+        receiver = Receiver([C.Json(data=card())])
+        receiver.message_str = ''
+        receiver.bot.call_action.side_effect = RuntimeError('unsupported')
+        await self.plugin.on_message(receiver)
+        await asyncio.gather(*list(self.plugin.tasks.values()))
+        result = list(self.plugin.jobs.values())[0]
+        self.assertEqual(result['status'], 'failed')
+        self.assertNotIn(receiver.unified_msg_origin + '|' + TARGET['url'], self.plugin.recent)
+        self.client.parse.assert_not_awaited()
+        self.assertEqual(self.plugin.store.cache_info()['entries'], 0)
+
+    async def test_disabled_or_quoted_miniapp_performs_no_query(self):
+        from astrbot_plugin_tieba_lens.tests.test_miniapp import card
+        receiver = Receiver([C.Json(data=card())])
+        self.plugin.config['blacklist'] = [receiver.get_group_id()]
+        await self.plugin.on_message(receiver)
+        self.assertFalse(self.plugin.tasks)
+        receiver.bot.call_action.assert_not_awaited()
+        self.plugin.config['blacklist'] = []
+        receiver.messages = [C.Reply(id='123', chain=[C.Json(data=card())])]
+        await self.plugin.on_message(receiver)
+        self.assertFalse(self.plugin.tasks)
+        receiver.bot.call_action.assert_not_awaited()
+
     async def test_old_hot_cache_is_sorted_for_both_render_and_export(self):
         settings = {**self.plugin.settings(), "sort": "hot"}
         target = parse_url(DOC["url"])
@@ -281,6 +326,129 @@ class IntegrationTests(unittest.IsolatedAsyncioTestCase):
         await asyncio.gather(*tasks)
         await self.plugin.on_message(Receiver())
         self.assertEqual(self.client.parse.await_count, 1)
+
+    async def test_concurrent_duplicate_admission_and_long_running_guard(self):
+        release = asyncio.Event()
+        entered = asyncio.Event()
+        original = self.plugin.renderer.render
+        async def slow_render(*args):
+            entered.set()
+            await release.wait()
+            return await original(*args)
+        self.plugin.renderer.render = slow_render
+        self.plugin.config['cooldown_seconds'] = 0
+        await asyncio.gather(self.plugin.on_message(Receiver()), self.plugin.on_message(Receiver()))
+        await asyncio.wait_for(entered.wait(), 2)
+        self.assertEqual(len(self.plugin.tasks), 1)
+        key = Receiver().unified_msg_origin + '|' + DOC['url']
+        self.plugin.recent[key] = -10000
+        await self.plugin.on_message(Receiver())
+        self.assertEqual(len(self.plugin.tasks), 1)
+        release.set()
+        await asyncio.gather(*list(self.plugin.tasks.values()))
+        self.assertFalse(self.plugin.pending_links)
+        self.assertGreater(self.plugin.recent[key], 0)
+
+    async def test_full_render_pipeline_is_serial_across_distinct_jobs(self):
+        active, peak = 0, 0
+        original = self.plugin.renderer.render
+        async def render(*args):
+            nonlocal active, peak
+            active += 1
+            peak = max(peak, active)
+            await asyncio.sleep(0.03)
+            try:
+                return await original(*args)
+            finally:
+                active -= 1
+        self.plugin.renderer.render = render
+        jobs = [await self.plugin.submit(parse_url(f'https://tieba.baidu.com/p/{value}'), self.plugin.settings())
+                for value in ('12345678', '99999999')]
+        results = await asyncio.gather(*(self.finish(job) for job in jobs))
+        self.assertTrue(all(job['status'] == 'done' for job in results))
+        self.assertEqual(peak, 1)
+
+    async def test_success_counter_failure_cannot_reclassify_confirmed_delivery(self):
+        original = self.plugin.store.increment
+        def increment(name):
+            if name == 'success':
+                raise OSError('database is locked')
+            return original(name)
+        receiver = Receiver()
+        with patch.object(self.plugin.store, 'increment', side_effect=increment):
+            result = await self.finish(await self.plugin.submit(parse_url(DOC['url']), self.plugin.settings(), event=receiver))
+        self.assertEqual(result['status'], 'done')
+        self.assertEqual(result['delivery_status'], 'sent')
+        self.assertEqual(len(receiver.sent), 1)
+        self.assertTrue(self.plugin.recent)
+
+    async def test_checkpoint_failure_does_not_resend_or_abort_remaining_pages(self):
+        self.plugin.renderer.pages = 2
+        original = self.plugin._save
+        async def save(job):
+            if job.get('status') == 'sending' and job.get('sent_messages'):
+                raise OSError('database is locked')
+            return await original(job)
+        receiver = Receiver()
+        with patch.object(self.plugin, '_save', side_effect=save):
+            result = await self.finish(await self.plugin.submit(parse_url(DOC['url']),
+                {**self.plugin.settings(), 'output_mode': 'card'}, event=receiver))
+        self.assertEqual(result['status'], 'done')
+        self.assertEqual(result['sent_messages'], 2)
+        self.assertEqual(len(receiver.sent), 2)
+
+    async def test_permanent_upload_error_releases_zero_send_guard_without_retry(self):
+        from aiocqhttp.exceptions import ActionFailed
+        receiver = Receiver()
+        receiver.send = AsyncMock(side_effect=[ActionFailed({'retcode':100,'wording':'图片上传失败: file not found'}), None])
+        result = await self.finish(await self.plugin.submit(parse_url(DOC['url']), self.plugin.settings(), event=receiver))
+        self.assertEqual(result['status'], 'delivery_failed')
+        self.assertEqual(result['delivery_status'], 'failed')
+        self.assertFalse(self.plugin.recent)
+        self.assertEqual(receiver.send.await_count, 2)
+        self.assertTrue(result['result_ready'])
+
+    async def test_uncertain_delivery_guard_is_restored_after_reload(self):
+        receiver = Receiver()
+        receiver.send = AsyncMock(side_effect=[TimeoutError('API timeout'), None])
+        await self.finish(await self.plugin.submit(parse_url(DOC['url']), self.plugin.settings(), event=receiver))
+        self.plugin.recent.clear()
+        await self.plugin._restore_delivery_guards()
+        self.assertIn(receiver.unified_msg_origin + '|' + DOC['url'], self.plugin.recent)
+
+    async def test_optional_cache_failures_do_not_fail_a_parsed_document(self):
+        with patch.object(self.plugin.store, 'get_cache', side_effect=OSError('database is locked')), \
+                patch.object(self.plugin.store, 'put_cache', side_effect=OSError('disk full')):
+            result = await self.finish(await self.plugin.submit(parse_url(DOC['url']), self.plugin.settings()))
+        self.assertEqual(result['status'], 'done')
+        self.assertTrue(result['result_ready'])
+
+    async def test_recover_interrupted_send_restores_guard_with_fresh_expiry(self):
+        receiver = Receiver()
+        result = await self.finish(await self.plugin.submit(parse_url(DOC['url']), self.plugin.settings(), event=receiver))
+        result.update(status='sending', delivery_status='sending', dedup_until=0)
+        self.plugin.store.save_job(result)
+        self.plugin.store.recover()
+        self.plugin.recent.clear()
+        await self.plugin._restore_delivery_guards()
+        self.assertIn(receiver.unified_msg_origin + '|' + DOC['url'], self.plugin.recent)
+
+    async def test_cancel_after_confirmed_send_keeps_done_and_guard(self):
+        original = self.plugin._react
+        async def reaction(event, settings, emoji, add):
+            if emoji == settings['reaction_done'] and add:
+                raise asyncio.CancelledError()
+            return await original(event, settings, emoji, add)
+        receiver = Receiver()
+        with patch.object(self.plugin, '_react', side_effect=reaction):
+            job = await self.plugin.submit(parse_url(DOC['url']), self.plugin.settings(), event=receiver)
+            task = self.plugin.tasks[job['id']]
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+        result = self.plugin.jobs[job['id']]
+        self.assertEqual(result['status'], 'done')
+        self.assertEqual(result['delivery_status'], 'sent')
+        self.assertTrue(self.plugin.recent)
 
     async def test_failure_is_visible_and_does_not_poison_cache(self):
         self.client.parse.side_effect = RuntimeError("读取失败")

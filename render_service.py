@@ -94,7 +94,9 @@ class RenderManager:
             try:
                 self.active = 'service'
                 # A failed shared service should not stall every future capture.
-                return await asyncio.wait_for(self.service_render(template, data, options), timeout=35)
+                # The screenshot itself allows 60 s. Cutting the request at
+                # 35 s could start a fallback while the service still renders.
+                return await asyncio.wait_for(self.service_render(template, data, options), timeout=70)
             except Exception as exc:
                 if mode == 'service' or _is_capture_size_error(exc):
                     raise
