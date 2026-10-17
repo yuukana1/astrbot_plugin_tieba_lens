@@ -8,7 +8,6 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import importlib.metadata
-import logging
 import math
 import os
 import re
@@ -21,8 +20,8 @@ import uuid
 from collections import OrderedDict
 from pathlib import Path
 
+from astrbot.api import logger
 
-logger = logging.getLogger(__name__)
 MAX_PIXELS = 24_000_000
 MAX_HEIGHT = 30_000
 INSTALL_TIMEOUT = 1800

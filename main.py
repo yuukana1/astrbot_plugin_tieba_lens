@@ -38,7 +38,7 @@ from .settings import ENUMS, GROUP_KEYS, effective_settings, public_settings, va
 from .storage import Store, cache_key
 
 PLUGIN_NAME = "astrbot_plugin_tieba_lens"
-VERSION = "1.2.1"
+VERSION = "1.2.2"
 JOB_ID = re.compile(r"[0-9a-f]{24}\Z")
 ACTIVE = {"queued", "fetching", "rendering", "sending"}
 PARSE_KEYS = GROUP_KEYS | {"image_width", "page_height", "max_pages"}
